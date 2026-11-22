@@ -344,6 +344,13 @@ create policy "profiles: update own" on public.profiles
 revoke update on public.profiles from authenticated, anon;
 grant update (full_name, title, job_roles) on public.profiles to authenticated;
 
+-- Table access for signed-in users. Don't rely on Supabase granting this automatically.
+-- The policies below still decide which rows each person gets. Signed-out visitors get nothing.
+grant usage on schema public to authenticated;
+grant select on public.profiles, public.section_roles to authenticated;
+grant select, insert, update, delete on public.questionnaires, public.questionnaire_members to authenticated;
+grant select, insert, update on public.responses to authenticated;
+
 -- questionnaires
 drop policy if exists "q: view" on public.questionnaires;
 create policy "q: view" on public.questionnaires
