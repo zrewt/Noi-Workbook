@@ -28,7 +28,7 @@ const timeAgo = (iso) => {
 const STATUS = { in_progress: 'In progress', submitted: 'Submitted', reviewed: 'Reviewed' };
 
 let api; let session = null; let profile = null;
-const state = { q: null, rows: {}, data: {}, members: [], role: null, section: null, calcs: [], timers: {}, pending: new Set() };
+const state = { q: null, rows: {}, data: {}, members: [], role: null, section: null, calcs: [], timers: {}, pending: new Set(), saving: new Set() };
 
 // ------------------------------------------------------------------ helpers
 function toast(msg, kind = '') {
@@ -851,7 +851,12 @@ function scheduleSave(key) {
   clearTimeout(state.timers[key]);
   state.timers[key] = setTimeout(() => saveNow(key), 700);
 }
-async function saveNow(key) {
+function saveNow(key) {
+  const job = persistSection(key);
+  state.saving.add(job);
+  return job.finally(() => state.saving.delete(job));
+}
+async function persistSection(key) {
   clearTimeout(state.timers[key]);
   if (!state.q) return;
   state.pending.delete(key);
@@ -865,7 +870,11 @@ async function saveNow(key) {
     state.timers[key] = setTimeout(() => saveNow(key), 4000);
   }
 }
-async function flushAll() { await Promise.all([...state.pending].map((k) => saveNow(k))); }
+// Waits for saves already on the wire too. Whatever failed is left in state.pending.
+async function flushAll() {
+  state.pending.forEach((k) => saveNow(k));
+  await Promise.all(state.saving);
+}
 
 // -------------------------------------------------------------- team view
 async function renderTeam() {
@@ -929,6 +938,11 @@ async function renderTeam() {
     if (status === 'submitted' && overall < 0.5 && !confirm(`Only ${Math.round(overall * 100)}% is answered. Submit anyway?`)) return;
     try {
       await flushAll();
+      // Submitting locks the answers, so it needs every save to have landed. Reopening must not wait: it is how a blocked save gets through.
+      if (status === 'submitted' && state.pending.size) {
+        const names = [...state.pending].map((k) => SECTION_MAP[k]?.title || k).join(', ');
+        return toast(`Not submitted because these answers didn't save: ${names}. Check your connection and try again.`, 'bad');
+      }
       await api.updateQuestionnaire(state.q.id, { status, submitted_at: status === 'submitted' ? new Date().toISOString() : state.q.submitted_at || null });
       state.q.status = status; toast({ submitted: 'Submitted for review', reviewed: 'Marked as reviewed', in_progress: 'Reopened for editing' }[status]);
       renderWorkbook(state.q.id, 'team');
