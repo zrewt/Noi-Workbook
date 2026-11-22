@@ -242,6 +242,83 @@ language sql stable security definer set search_path = public as $$
 $$;
 
 -- ---------------------------------------------------------------------
+-- Locking: answers and photos can only change while a workbook is in progress.
+--   in_progress -> submitted    owner, editor or admin
+--   submitted   -> reviewed     admin
+--   submitted / reviewed -> in_progress    owner or admin
+-- auth.uid() is null in the SQL Editor, so maintenance there is not restricted.
+-- ---------------------------------------------------------------------
+create or replace function public.is_open(q uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce((select status = 'in_progress' from public.questionnaires where id = q), false)
+$$;
+
+create or replace function public.guard_questionnaire()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  if auth.uid() is null then return new; end if;
+
+  if tg_op = 'INSERT' then
+    new.status := 'in_progress';
+    new.submitted_at := null;
+    return new;
+  end if;
+
+  new.id := old.id;
+  new.created_by := old.created_by;
+  new.created_at := old.created_at;
+
+  if new.status is not distinct from old.status then
+    new.submitted_at := old.submitted_at;
+  elsif old.status = 'in_progress' and new.status = 'submitted' and public.can_edit(old.id) then
+    new.submitted_at := now();
+  elsif old.status = 'submitted' and new.status = 'reviewed' and public.is_admin() then
+    new.submitted_at := old.submitted_at;
+  elsif new.status = 'in_progress' and public.is_owner(old.id) then
+    new.submitted_at := old.submitted_at;
+  else
+    raise exception 'You do not have permission to change this workbook from % to %', old.status, new.status
+      using errcode = '42501';
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists questionnaire_guard on public.questionnaires;
+create trigger questionnaire_guard
+  before insert or update on public.questionnaires
+  for each row execute function public.guard_questionnaire();
+
+-- A trigger rather than a policy, so it can lock the workbook row: a save that
+-- races a submit waits for it, then sees the new status.
+-- The name must sort before responses_stamp, which updates that same row.
+create or replace function public.guard_response()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  current_status text;
+begin
+  if auth.uid() is null then return new; end if;
+
+  if tg_op = 'UPDATE' and new.questionnaire_id <> old.questionnaire_id then
+    raise exception 'Answers cannot be moved to another workbook' using errcode = '42501';
+  end if;
+  if not public.can_edit(new.questionnaire_id) then
+    raise exception 'You cannot edit this workbook' using errcode = '42501';
+  end if;
+
+  select status into current_status from public.questionnaires
+    where id = new.questionnaire_id for no key update;
+  if current_status is distinct from 'in_progress' then
+    raise exception 'This workbook is locked because it was submitted' using errcode = '42501';
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists responses_lock on public.responses;
+create trigger responses_lock
+  before insert or update on public.responses
+  for each row execute function public.guard_response();
+
+-- ---------------------------------------------------------------------
 -- Row level security
 -- ---------------------------------------------------------------------
 alter table public.profiles              enable row level security;
@@ -331,12 +408,15 @@ create policy "photos: view" on storage.objects
 drop policy if exists "photos: upload" on storage.objects;
 create policy "photos: upload" on storage.objects
   for insert to authenticated
-  with check (bucket_id = 'site-photos' and public.can_edit(public.path_qid(name)));
+  with check (bucket_id = 'site-photos' and public.can_edit(public.path_qid(name))
+              and public.is_open(public.path_qid(name)));
 
 drop policy if exists "photos: delete" on storage.objects;
+-- Owners can still delete photos when locked: "Delete workbook" removes them first.
 create policy "photos: delete" on storage.objects
   for delete to authenticated
-  using (bucket_id = 'site-photos' and public.can_edit(public.path_qid(name)));
+  using (bucket_id = 'site-photos' and public.can_edit(public.path_qid(name))
+         and (public.is_open(public.path_qid(name)) or public.is_owner(public.path_qid(name))));
 
 -- ---------------------------------------------------------------------
 -- Make yourself an admin (sees and manages every questionnaire).
