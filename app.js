@@ -28,7 +28,8 @@ const timeAgo = (iso) => {
 const STATUS = { in_progress: 'In progress', submitted: 'Submitted', reviewed: 'Reviewed' };
 
 let api; let session = null; let profile = null;
-const state = { q: null, rows: {}, data: {}, members: [], role: null, section: null, calcs: [], timers: {}, pending: new Set(), saving: new Set() };
+const state = { q: null, rows: {}, data: {}, members: [], role: null, section: null, calcs: [] };
+const unsaved = new Map(); // edits not yet saved, across all workbooks (see "saving" below)
 
 // ------------------------------------------------------------------ helpers
 function toast(msg, kind = '') {
@@ -105,7 +106,7 @@ async function boot() {
     }
   });
   window.addEventListener('hashchange', render);
-  window.addEventListener('beforeunload', (e) => { if (state.pending.size) { flushAll(); e.preventDefault(); } });
+  window.addEventListener('beforeunload', (e) => { if (unsaved.size) { flushAll(); e.preventDefault(); } });
   render();
 }
 
@@ -394,10 +395,13 @@ function renderAccount() {
 async function loadWorkbook(id) {
   if (state.q && state.q.id === id && state.loadedFor === session.user.id) return true;
   state.loadedFor = session.user.id;
+  const waiting = unsavedIn(id); // taken before fetching, as one may land while we fetch
   const [q, rows, members] = await Promise.all([api.getQuestionnaire(id), api.getResponses(id), api.listMembers(id)]);
+  if (!location.hash.startsWith(`#/q/${id}`)) return null; // navigated away while loading
   if (!q) return false;
   state.q = q; state.rows = rows; state.members = members;
   state.data = Object.fromEntries(Object.entries(rows).map(([k, r]) => [k, r.data || {}]));
+  [...waiting, ...unsavedIn(id)].forEach((e) => { state.data[e.key] = e.data; });
   const me = members.find((m) => m.email === (session.user.email || '').toLowerCase());
   state.role = me ? me.role : (profile.is_admin ? 'owner' : 'viewer');
   return true;
@@ -407,6 +411,7 @@ async function renderWorkbook(id, sectionKey) {
   if (!state.q || state.q.id !== id) app.innerHTML = topbar() + '<main class="dash"><div class="loading">Opening workbook…</div></main>';
   let ok;
   try { ok = await loadWorkbook(id); } catch (e) { ok = false; }
+  if (ok === null || !location.hash.startsWith(`#/q/${id}`)) return;
   if (!ok) {
     app.innerHTML = topbar() + `<main class="dash"><div class="empty"><h2>Workbook not found</h2><p>It may have been deleted, or you haven't been added to it. Ask the workbook owner to add <b>${esc(session.user.email)}</b>.</p><a class="btn" href="#/">Back to workbooks</a></div></main>`;
     wireTopbar(); return;
@@ -476,6 +481,8 @@ function sectionNavButtons(section) {
 }
 
 function savedLine(key) {
+  const edit = unsavedIn(state.q.id).find((e) => e.key === key);
+  if (edit) return edit.error ? `Not saved — ${esc(edit.error)}. Retrying…` : 'Saving…';
   const r = state.rows[key];
   if (!r || !r.updated_at) return 'Not started';
   return `Saved ${timeAgo(r.updated_at)}${r.updated_by_email ? ' by ' + esc(r.updated_by_email) : ''}`;
@@ -804,13 +811,18 @@ function wireForm(section) {
       updateNavRing(); scheduleSave(state.section);
     } else if (b.dataset.delphoto) {
       const path = b.dataset.delphoto; const fid = b.closest('[data-photos]').dataset.photos;
-      d[fid] = (d[fid] || []).filter((p) => p !== path); await saveNow(state.section);
-      api.deletePhoto(path).catch(() => {}); rerender();
+      const qid = state.q.id;
+      d[fid] = (d[fid] || []).filter((p) => p !== path);
+      const edit = queueSave(qid, section.key, d);
+      edit.removedPhotos.push(path); // the file is deleted only once this save lands
+      await save(edit);
+      if (showing(qid, section.key)) rerender();
     }
   });
   form.addEventListener('change', async (e) => {
     const el = e.target; if (!el.dataset.upload) return;
     const fid = el.dataset.upload; const box = el.closest('[data-photos]'); const max = Number(box.dataset.max);
+    const qid = state.q.id; const key = section.key;
     const d = state.data[state.section]; const cur = Array.isArray(d[fid]) ? d[fid] : [];
     const files = [...el.files].slice(0, max - cur.length);
     if (!files.length) return;
@@ -818,9 +830,13 @@ function wireForm(section) {
     try {
       for (const file of files) {
         if (file.size > 10 * 1024 * 1024) { toast(`${file.name} is over 10 MB — choose a smaller image.`, 'bad'); continue; }
-        cur.push(await api.uploadPhoto(state.q.id, file));
+        const path = await api.uploadPhoto(qid, file);
+        // look the answers up again: the user may have moved on during the upload
+        const latest = await sectionData(qid, key);
+        latest[fid] = [...(latest[fid] || []), path];
+        await save(queueSave(qid, key, latest));
       }
-      d[fid] = cur; await saveNow(state.section); rerender();
+      if (showing(qid, key)) rerender();
     } catch (ex) { toast('Upload failed: ' + errMsg(ex), 'bad'); box.classList.remove('busy'); }
   });
   $$('[data-goto]').forEach((a) => { a.onclick = (e) => { e.preventDefault(); go(`#/q/${state.q.id}/${a.dataset.goto}`); }; });
@@ -844,44 +860,78 @@ async function hydratePhotos() {
 function setSaveState(text, cls = '') {
   const el = $('#saveState'); if (el) { el.textContent = text; el.className = 'save-state ' + cls; }
 }
+// Every edit remembers its own workbook, user and data, so a save or retry never
+// depends on what is on screen by then. One section has one save running at a time.
+const isOpen = (qid) => state.q?.id === qid;
+const showing = (qid, key) => isOpen(qid) && state.section === key && location.hash === `#/q/${qid}/${key}`;
+const unsavedIn = (qid) => [...unsaved.values()].filter((e) => e.qid === qid && e.uid === session?.user.id);
+
+function queueSave(qid, key, data) {
+  const id = `${session.user.id}/${qid}/${key}`;
+  if (!unsaved.has(id)) unsaved.set(id, { id, uid: session.user.id, qid, key, rev: 0, removedPhotos: [], error: '', timer: null, job: null });
+  const edit = unsaved.get(id);
+  edit.data = data; edit.rev++; edit.error = '';
+  return edit;
+}
 function scheduleSave(key) {
-  if (locked() || (SECTION_MAP[key] && !canEditSection(SECTION_MAP[key]))) return;
-  state.pending.add(key);
+  if (!state.q || locked() || (SECTION_MAP[key] && !canEditSection(SECTION_MAP[key]))) return;
+  const edit = queueSave(state.q.id, key, state.data[key] || {});
   setSaveState('Saving…', 'saving');
-  clearTimeout(state.timers[key]);
-  state.timers[key] = setTimeout(() => saveNow(key), 700);
+  clearTimeout(edit.timer);
+  edit.timer = setTimeout(() => save(edit), 700);
 }
-function saveNow(key) {
-  const job = persistSection(key);
-  state.saving.add(job);
-  return job.finally(() => state.saving.delete(job));
+async function save(edit) {
+  while (edit.job) await edit.job; // let the older save finish so it can't overwrite this one
+  if (unsaved.get(edit.id) !== edit || edit.uid !== session?.user.id) return;
+  clearTimeout(edit.timer);
+  edit.job = sendSave(edit).finally(() => { edit.job = null; });
+  await edit.job;
 }
-async function persistSection(key) {
-  clearTimeout(state.timers[key]);
-  if (!state.q) return;
-  state.pending.delete(key);
+async function sendSave(edit) {
+  const { qid, key, rev } = edit;
+  const data = structuredClone(edit.data);
   try {
-    const row = await api.saveResponse(state.q.id, key, state.data[key] || {});
-    state.rows[key] = { ...(state.rows[key] || {}), ...row, data: state.data[key] };
-    if (state.section === key) setSaveState(savedLine(key), 'ok');
+    const row = await api.saveResponse(qid, key, data);
+    if (isOpen(qid)) state.rows[key] = { ...(state.rows[key] || {}), ...row, data };
+    if (edit.rev !== rev) return; // edited again meanwhile, so that newer save finishes the job
+    unsaved.delete(edit.id);
+    edit.removedPhotos.forEach((p) => api.deletePhoto(p).catch(() => {}));
+    if (showing(qid, key)) setSaveState(savedLine(key), 'ok');
   } catch (e) {
-    state.pending.add(key);
-    if (state.section === key) setSaveState('Not saved — ' + errMsg(e) + '. Retrying…', 'bad');
-    state.timers[key] = setTimeout(() => saveNow(key), 4000);
+    if (unsaved.get(edit.id) !== edit) return; // the workbook was deleted meanwhile
+    edit.error = errMsg(e);
+    if (showing(qid, key)) setSaveState('Not saved — ' + edit.error + '. Retrying…', 'bad');
+    clearTimeout(edit.timer);
+    edit.timer = setTimeout(() => save(edit), 4000);
   }
 }
-// Waits for saves already on the wire too. Whatever failed is left in state.pending.
+async function sectionData(qid, key) {
+  if (isOpen(qid)) return state.data[key] || (state.data[key] = {});
+  const edit = unsavedIn(qid).find((e) => e.key === key);
+  return edit ? edit.data : (await api.getResponses(qid))[key]?.data || {};
+}
+function forgetEdits(qid) {
+  unsavedIn(qid).forEach((e) => { clearTimeout(e.timer); unsaved.delete(e.id); });
+}
+// Waits for saves already on the wire too. Whatever failed is left in unsaved.
 async function flushAll() {
-  state.pending.forEach((k) => saveNow(k));
-  await Promise.all(state.saving);
+  await Promise.all([...unsaved.values()].map(save));
 }
 
 // -------------------------------------------------------------- team view
 async function renderTeam() {
   state.section = 'team'; state.calcs = [];
   const main = $('#main');
-  state.members = await api.listMembers(state.q.id).catch(() => state.members);
-  const people = await api.teamProfiles(state.q.id).catch(() => []);
+  const qid = state.q.id;
+  const members = await api.listMembers(qid).catch(() => state.members);
+  const people = await api.teamProfiles(qid).catch(() => []);
+  const fresh = await api.getQuestionnaire(qid).catch(() => null);
+  if (!showing(qid, 'team')) return;
+  if (fresh && fresh.status !== state.q.status) { // someone else submitted, reviewed or reopened it
+    state.q.status = fresh.status;
+    return renderWorkbook(qid, 'team');
+  }
+  state.members = members;
   const byEmail = Object.fromEntries(people.map((x) => [x.email, x]));
   const coverers = (sec) => people.filter((x) => sectionForRoles(sec, x.job_roles || []));
   const personName = (x) => esc(x.full_name || x.email.split('@')[0]);
@@ -934,18 +984,22 @@ async function renderTeam() {
     </section>`;
 
   $$('[data-status]').forEach((b) => { b.onclick = async () => {
-    const status = b.dataset.status;
+    const status = b.dataset.status; const q = state.q; // not state.q after an await: the user may have switched
     if (status === 'submitted' && overall < 0.5 && !confirm(`Only ${Math.round(overall * 100)}% is answered. Submit anyway?`)) return;
     try {
       await flushAll();
       // Submitting locks the answers, so it needs every save to have landed. Reopening must not wait: it is how a blocked save gets through.
-      if (status === 'submitted' && state.pending.size) {
-        const names = [...state.pending].map((k) => SECTION_MAP[k]?.title || k).join(', ');
-        return toast(`Not submitted because these answers didn't save: ${names}. Check your connection and try again.`, 'bad');
+      const failed = unsavedIn(q.id);
+      if (status === 'submitted' && failed.length) {
+        const names = failed.map((e) => SECTION_MAP[e.key]?.title || e.key).join(', ');
+        return toast(`Not submitted because these answers didn't save: ${names} (${failed[0].error || 'still saving'}). Try again in a moment.`, 'bad');
       }
-      await api.updateQuestionnaire(state.q.id, { status, submitted_at: status === 'submitted' ? new Date().toISOString() : state.q.submitted_at || null });
-      state.q.status = status; toast({ submitted: 'Submitted for review', reviewed: 'Marked as reviewed', in_progress: 'Reopened for editing' }[status]);
-      renderWorkbook(state.q.id, 'team');
+      await api.updateQuestionnaire(q.id, { status, submitted_at: status === 'submitted' ? new Date().toISOString() : q.submitted_at || null });
+      q.status = status;
+      if (isOpen(q.id)) state.q.status = status; // it may have been reloaded meanwhile
+      toast({ submitted: 'Submitted for review', reviewed: 'Marked as reviewed', in_progress: 'Reopened for editing' }[status]);
+      if (showing(q.id, 'team')) renderWorkbook(q.id, 'team');
+      if (status === 'in_progress') flushAll(); // send what the lock was holding back
     } catch (e) { toast(errMsg(e), 'bad'); }
   }; });
   $$('[data-role]').forEach((s) => { s.onchange = async () => { try { await api.addMember(state.q.id, s.dataset.role, s.value); toast('Role updated'); } catch (e) { toast(errMsg(e), 'bad'); } }; });
@@ -953,27 +1007,32 @@ async function renderTeam() {
     const email = b.dataset.remove;
     if (state.members.filter((m) => m.role === 'owner').length === 1 && state.members.find((m) => m.email === email)?.role === 'owner') return toast('Add another owner before removing the last one.', 'bad');
     if (!confirm(`Remove ${email} from this workbook?`)) return;
-    try { await api.removeMember(state.q.id, email); toast('Removed ' + email); renderTeam(); } catch (e) { toast(errMsg(e), 'bad'); }
+    try { await api.removeMember(state.q.id, email); toast('Removed ' + email); if (showing(qid, 'team')) renderTeam(); } catch (e) { toast(errMsg(e), 'bad'); }
   }; });
   const add = $('#addMember');
   if (add) add.onsubmit = async (e) => {
     e.preventDefault(); const v = Object.fromEntries(new FormData(add));
     if (!/^\S+@\S+\.\S+$/.test(v.email)) return toast('Enter a valid email address.', 'bad');
-    try { await api.addMember(state.q.id, v.email, v.role); toast('Added ' + v.email.toLowerCase()); renderTeam(); } catch (ex) { toast(errMsg(ex), 'bad'); }
+    try { await api.addMember(state.q.id, v.email, v.role); toast('Added ' + v.email.toLowerCase()); if (showing(qid, 'team')) renderTeam(); } catch (ex) { toast(errMsg(ex), 'bad'); }
   };
   $('#propForm').onsubmit = async (e) => {
     e.preventDefault(); const v = Object.fromEntries(new FormData(e.target));
     if (!v.property_name.trim()) return toast('Enter a property name.', 'bad');
-    try { await api.updateQuestionnaire(state.q.id, v); Object.assign(state.q, v); toast('Property saved'); renderWorkbook(state.q.id, 'team'); } catch (ex) { toast(errMsg(ex), 'bad'); }
+    const q = state.q;
+    try { await api.updateQuestionnaire(q.id, v); Object.assign(q, v); toast('Property saved'); if (showing(q.id, 'team')) renderWorkbook(q.id, 'team'); } catch (ex) { toast(errMsg(ex), 'bad'); }
   };
   const del = $('#del');
   if (del) del.onclick = async () => {
-    const name = prompt(`Type the property name to delete this workbook:\n${state.q.property_name}`);
-    if (name !== state.q.property_name) return name !== null && toast('Name did not match — nothing was deleted.');
+    const q = state.q; // not state.q after an await: the user may have switched
+    const name = prompt(`Type the property name to delete this workbook:\n${q.property_name}`);
+    if (name !== q.property_name) return name !== null && toast('Name did not match — nothing was deleted.');
     try {
-      const photos = Object.values(state.data).flatMap((d) => Object.values(d || {}).filter((v) => Array.isArray(v) && typeof v[0] === 'string' && v[0].startsWith(state.q.id + '/')).flat());
+      const photos = Object.values(state.data).flatMap((d) => Object.values(d || {}).filter((v) => Array.isArray(v) && typeof v[0] === 'string' && v[0].startsWith(q.id + '/')).flat())
+        .concat(unsavedIn(q.id).flatMap((e) => e.removedPhotos));
       await Promise.all(photos.map((p) => api.deletePhoto(p).catch(() => {})));
-      await api.deleteQuestionnaire(state.q.id); state.q = null; toast('Workbook deleted'); go('#/');
+      await api.deleteQuestionnaire(q.id);
+      forgetEdits(q.id); toast('Workbook deleted');
+      if (isOpen(q.id)) { state.q = null; go('#/'); }
     } catch (ex) { toast(errMsg(ex), 'bad'); }
   };
   $('#exportJson').onclick = () => download(`${slug(state.q.property_name)}-noi-workbook.json`, JSON.stringify({ property: state.q, answers: state.data }, null, 2), 'application/json');
